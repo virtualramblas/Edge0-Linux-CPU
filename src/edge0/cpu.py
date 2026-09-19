@@ -17,19 +17,37 @@ class BailingConfig:
     topk_group: int = 4
     routed_scaling_factor: float = 2.5
     intermediate_size: int = 512
+    moe_intermediate_size: int = 512
+    moe_shared_expert_intermediate_size: int = 512
+    num_shared_experts: int = 1
     layer_group_size: int = 4
     first_k_dense_replace: int = 1
+    short_conv_kernel_size: int = 4
+    head_dim: int = 128
+    rms_norm_eps: float = 1e-6
+    q_lora_rank: int = 256
+    kv_lora_rank: int = 512
     rope_theta: float = 6000000.0
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
     num_attention_heads: int = 16
+    num_key_value_heads: int = 16
+    kda_safe_gate: bool = True
+    kda_lower_bound: float = -5.0
+
+    @property
+    def qk_head_dim(self): return self.qk_nope_head_dim + self.qk_rope_head_dim
 
     @classmethod
     def from_json(cls, path):
         data = json.loads(Path(path).read_text())
         names = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in data.items() if k in names})
+
+    def is_mla_layer(self, idx):
+        full = self.num_hidden_layers // self.layer_group_size * self.layer_group_size
+        return (idx + 1) % self.layer_group_size == 0 or idx >= full
 
 def group_router(logits, expert_bias=None, *, top_k=8, n_group=8,
                  topk_group=4, routed_scaling=2.5):
