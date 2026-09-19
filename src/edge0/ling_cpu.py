@@ -52,17 +52,73 @@ def kda_recurrence(q, k, v, g_log, beta, state=None):
         outs.append(torch.einsum("bhde,bhd->bhe", S, qt))
     return torch.stack(outs, dim=1), S
 
-def rope_interleave(x, positions, theta):
-    # Matches _rope_interleave_torch in the upstream vendored model.
-    b, h, t, d = x.shape
-    inv = 1.0 / (theta ** (torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / d))
-    angles = torch.outer(positions.float(), inv)
-    emb = torch.cat((angles, angles), dim=-1)
-    c, s = emb.cos()[None, None], emb.sin()[None, None]
-    xi = x.reshape(b, h, t, d // 2, 2).transpose(-1, -2).reshape(b, h, t, d)
-    half = d // 2
-    rot = torch.cat((-xi[..., half:], xi[..., :half]), dim=-1)
-    return xi * c + rot * s
+def rope_interleave(x, positions, rope_theta):
+    """
+    Apply interleaved rotary position embedding.
+
+    Expected x shape:
+        [batch, heads, sequence, rotary_dim]
+
+    positions:
+        [sequence]
+
+    rotary_dim must be even.
+
+    Dimensions are paired as:
+        (0, 1), (2, 3), ...
+
+    so each pair is rotated as:
+        x0' = x0 * cos - x1 * sin
+        x1' = x0 * sin + x1 * cos
+    """
+    rotary_dim = x.shape[-1]
+
+    if rotary_dim % 2 != 0:
+        raise ValueError(
+            f"RoPE dimension must be even, got {rotary_dim}"
+        )
+
+    if positions.ndim != 1:
+        raise ValueError(
+            f"positions must be 1-D, got shape {tuple(positions.shape)}"
+        )
+
+    half_dim = rotary_dim // 2
+
+    # Match the usual interleaved RoPE frequency layout.
+    inv_freq = 1.0 / (
+        rope_theta
+        ** (
+            torch.arange(
+                0,
+                half_dim,
+                device=x.device,
+                dtype=torch.float32,
+            )
+            / half_dim
+        )
+    )
+
+    angles = positions.to(torch.float32)[:, None] * inv_freq[None, :]
+
+    cos = torch.cos(angles).to(dtype=x.dtype)
+    sin = torch.sin(angles).to(dtype=x.dtype)
+
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+
+    # [sequence, half_dim] -> broadcast over batch/head.
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+
+    y_even = x_even * cos - x_odd * sin
+    y_odd = x_even * sin + x_odd * cos
+
+    y = torch.empty_like(x)
+    y[..., 0::2] = y_even
+    y[..., 1::2] = y_odd
+
+    return y
 
 def causal_mask(query_len, key_len, device):
     qpos = torch.arange(key_len - query_len, key_len, device=device)
