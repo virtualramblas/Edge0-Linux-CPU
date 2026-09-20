@@ -28,7 +28,16 @@ class ShortConv1d(nn.Module):
         return y, new_state
 
 def kda_gate(f, A_log, dt_bias, lower_bound=-5.0, safe_gate=True):
-    f = f.float() + dt_bias.float().reshape(1, 1, *dt_bias.shape)
+    f = f.float()
+
+    if dt_bias.numel() != f.shape[-2] * f.shape[-1]:
+        raise ValueError(
+            f"KDA dt_bias shape {tuple(dt_bias.shape)} is incompatible "
+            f"with f shape {tuple(f.shape)}"
+        )
+
+    dt_bias = dt_bias.float().reshape(f.shape[-2], f.shape[-1])
+    f = f + dt_bias.reshape(1, 1, f.shape[-2], f.shape[-1])
     a = torch.exp(A_log.float()).reshape(1, 1, -1, 1)
     if safe_gate:
         return lower_bound * torch.sigmoid(a * f)
