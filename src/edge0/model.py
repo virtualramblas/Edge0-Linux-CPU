@@ -6,8 +6,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
 from .cpu import BailingConfig, group_router
-from .ling_cpu import KDAReference, MLAReference
+from .ling_cpu import KDAReference, MLAReference, LoRALinear
 from .checkpoint import sanitize_bailing_weights, build_state_dict
+from .quant_cpu import QuantizedLinear, QuantizedLoRALinear
 
 class RMSNorm(nn.Module):
     def __init__(self,n,eps=1e-6):
@@ -17,9 +18,62 @@ class RMSNorm(nn.Module):
         return y.to(x.dtype)*self.weight
 
 class DenseMLP(nn.Module):
-    def __init__(self,h,i):
-        super().__init__(); self.gate_proj=nn.Linear(h,i,bias=False); self.up_proj=nn.Linear(h,i,bias=False); self.down_proj=nn.Linear(i,h,bias=False)
-    def forward(self,x): return self.down_proj(F.silu(self.gate_proj(x))*self.up_proj(x))
+    def __init__(
+        self,
+        hidden_size,
+        intermediate_size,
+        use_lora=False,
+        use_quantized=False,
+    ):
+        super().__init__()
+
+        if use_quantized and use_lora:
+            Linear = QuantizedLoRALinear
+        elif use_quantized:
+            Linear = QuantizedLinear
+        elif use_lora:
+            Linear = LoRALinear
+        else:
+            Linear = nn.Linear
+
+        if use_lora and use_quantized:
+            kwargs = {
+                "rank": 16,
+                "alpha": 32,
+            }
+        else:
+            kwargs = {}
+
+        self.gate_proj = Linear(
+            hidden_size,
+            intermediate_size,
+            **kwargs,
+        )
+
+        self.up_proj = Linear(
+            hidden_size,
+            intermediate_size,
+            **kwargs,
+        )
+
+        self.down_proj = Linear(
+            intermediate_size,
+            hidden_size,
+            **kwargs,
+        )
+
+        self.mlp = DenseMLP(
+          hidden_size,
+          intermediate_size,
+          use_lora=True,
+          use_quantized=True,
+      )
+
+    def forward(self, x):
+        return self.down_proj(
+            F.silu(self.gate_proj(x))
+            * self.up_proj(x)
+        )
 
 class ExpertStore(nn.Module):
     def __init__(self,c,layer):
@@ -84,15 +138,91 @@ class BailingCPUModel(nn.Module):
         return self.lm_head(self.norm(h)),new
 
 def load_ram_model(model_dir):
-    root=Path(model_dir); cfg=BailingConfig.from_json(root/"config.json"); raw={}
+    root = Path(model_dir)
+    cfg = BailingConfig.from_json(root / "config.json")
+
+    raw = {}
     for p in sorted(root.glob("*.safetensors")):
-        with safe_open(str(p),framework="pt",device="cpu") as f:
-            for k in f.keys(): raw[k]=f.get_tensor(k).contiguous()
-    tensors=sanitize_bailing_weights(raw,cfg.num_hidden_layers,cfg.num_experts)
-    model=BailingCPUModel(cfg,tensors)
-    state=build_state_dict(tensors); own=dict(model.named_parameters()); loaded=[]; skipped=[]
-    for k,v in state.items():
-        if k in own and own[k].shape==v.shape:
-            own[k].data.copy_(v.to(dtype=own[k].dtype)); loaded.append(k)
-        else: skipped.append((k,tuple(v.shape)))
-    return model,cfg,loaded,skipped
+        with safe_open(str(p), framework="pt", device="cpu") as f:
+            for k in f.keys():
+                raw[k] = f.get_tensor(k).contiguous()
+
+    tensors = sanitize_bailing_weights(
+        raw,
+        cfg.num_hidden_layers,
+        cfg.num_experts,
+    )
+
+    model = BailingCPUModel(cfg, tensors)
+
+    state = build_state_dict(tensors)
+    own = dict(model.named_parameters())
+
+    loaded = []
+    skipped = []
+
+    for k, v in state.items():
+        if k in own:
+            if own[k].shape == v.shape:
+                loaded.append((k, tuple(v.shape)))
+            else:
+                skipped.append(
+                    (
+                        k,
+                        tuple(v.shape),
+                        "shape mismatch",
+                        tuple(own[k].shape),
+                    )
+                )
+        else:
+            skipped.append(
+                (
+                    k,
+                    tuple(v.shape),
+                    "missing model parameter",
+                    None,
+                )
+            )
+
+    print("\n=== LOAD DIAGNOSTIC ===")
+    print("checkpoint entries:", len(state))
+    print("model parameters:", len(own))
+    print("shape/name matches:", len(loaded))
+    print("skipped:", len(skipped))
+
+    from collections import Counter
+
+    def skipped_component(key):
+        parts = key.split(".")
+
+        if parts[0] == "layers":
+            # layers.0.attn.q_proj.lora_A -> attn.q_proj.lora_A
+            return ".".join(parts[2:])
+
+        return key
+
+
+    print("\n=== SKIPPED COMPONENTS ===")
+
+    counts = Counter(skipped_component(x[0]) for x in skipped)
+
+    for k, n in counts.most_common():
+        print(f"{n:4d}  {k}")
+
+
+    print("\n=== FIRST 150 SKIPPED ===")
+
+    for x in skipped[:150]:
+        print(x)
+
+
+
+    print("\n=== MATCHES ===")
+    for item in loaded:
+        print(item)
+
+    print("\n=== FIRST 100 SKIPPED ===")
+    for item in skipped[:100]:
+        print(item)
+
+    return model, cfg, loaded, skipped

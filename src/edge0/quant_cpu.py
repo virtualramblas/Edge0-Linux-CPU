@@ -1,5 +1,7 @@
 """CPU implementation of Edge0's 4-bit affine expert matmul."""
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 def _as_bf16(x: torch.Tensor) -> torch.Tensor:
     """
@@ -239,3 +241,141 @@ def expert_linear(
         x.to(weight.dtype),
         weight.transpose(-1, -2),
     )
+
+class QuantizedLinear(nn.Module):
+    """
+    INT4 affine-quantized linear layer.
+
+    Checkpoint representation:
+        weight: [out_features, ceil(in_features / 8)] uint32
+        scales: [out_features, ceil(in_features / group_size)] bf16
+        biases: [out_features, ceil(in_features / group_size)] bf16
+
+    Logical weight:
+        [out_features, in_features]
+    """
+
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        group_size=64,
+    ):
+        super().__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+
+        packed_in = (in_features + 7) // 8
+        groups = (in_features + group_size - 1) // group_size
+
+        self.register_buffer(
+            "weight",
+            torch.empty(
+                out_features,
+                packed_in,
+                dtype=torch.uint32,
+            ),
+        )
+
+        self.register_buffer(
+            "scales",
+            torch.empty(
+                out_features,
+                groups,
+                dtype=torch.bfloat16,
+            ),
+        )
+
+        self.register_buffer(
+            "biases",
+            torch.empty(
+                out_features,
+                groups,
+                dtype=torch.bfloat16,
+            ),
+        )
+
+    def forward(self, x):
+        return expert_linear(
+            x,
+            self.weight,
+            self.scales,
+            self.biases,
+            group_size=self.group_size,
+        )
+
+class QuantizedLoRALinear(nn.Module):
+    """
+    INT4 affine base weight plus LoRA A/B.
+    """
+
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        rank=16,
+        alpha=32,
+        group_size=64,
+    ):
+        super().__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        self.scaling = alpha / rank
+
+        packed_in = (in_features + 7) // 8
+        groups = (in_features + group_size - 1) // group_size
+
+        self.register_buffer(
+            "weight",
+            torch.empty(
+                out_features,
+                packed_in,
+                dtype=torch.uint32,
+            ),
+        )
+
+        self.register_buffer(
+            "scales",
+            torch.empty(
+                out_features,
+                groups,
+                dtype=torch.bfloat16,
+            ),
+        )
+
+        self.register_buffer(
+            "biases",
+            torch.empty(
+                out_features,
+                groups,
+                dtype=torch.bfloat16,
+            ),
+        )
+
+        self.lora_A = nn.Parameter(
+            torch.zeros(rank, in_features)
+        )
+
+        self.lora_B = nn.Parameter(
+            torch.zeros(out_features, rank)
+        )
+
+    def forward(self, x):
+        base = expert_linear(
+            x,
+            self.weight,
+            self.scales,
+            self.biases,
+            group_size=self.group_size,
+        )
+
+        delta = F.linear(
+            F.linear(x, self.lora_A),
+            self.lora_B,
+        )
+
+        return base + self.scaling * delta

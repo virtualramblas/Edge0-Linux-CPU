@@ -26,19 +26,17 @@ def sanitize_bailing_weights(weights, num_layers=24, num_experts=128):
     """
     Normalize Edge0 checkpoint weights.
 
-    Supports both:
-      1. Per-expert checkpoint tensors:
+    Supports:
+      1. Per-expert tensors:
            experts.0.gate_proj.weight
            experts.1.gate_proj.weight
            ...
 
-      2. The real Edge0-8B checkpoint layout, where experts are already
-         stacked:
+      2. Real Edge0-8B stacked tensors:
            experts.gate_proj.weight
            shape [num_experts, out_features, packed_features]
     """
 
-    # Remove MTP tensors, matching the upstream sanitization behavior.
     out = {
         k: v
         for k, v in weights.items()
@@ -52,9 +50,7 @@ def sanitize_bailing_weights(weights, num_layers=24, num_experts=128):
             for part in ("weight", "scales", "biases"):
                 stacked_key = f"{prefix}.{proj}.{part}"
 
-                # ---------------------------------------------------------
-                # Case 1: already stacked -- this is the real checkpoint.
-                # ---------------------------------------------------------
+                # Real checkpoint: already stacked.
                 if stacked_key in out:
                     tensor = out[stacked_key]
 
@@ -72,10 +68,7 @@ def sanitize_bailing_weights(weights, num_layers=24, num_experts=128):
 
                     continue
 
-                # ---------------------------------------------------------
-                # Case 2: individual experts -- used by the unit tests and
-                # older checkpoint layouts.
-                # ---------------------------------------------------------
+                # Older/per-expert layout.
                 keys = [
                     f"{prefix}.{e}.{proj}.{part}"
                     for e in range(num_experts)
@@ -88,8 +81,7 @@ def sanitize_bailing_weights(weights, num_layers=24, num_experts=128):
                     [out.pop(key) for key in keys]
                 )
 
-    # Upstream checkpoint conv layout is [C, 1, K] or [C, K].
-    # PyTorch Conv1d consumes [C, 1, K].
+    # Upstream Conv1d layout is [C, K] or [C, 1, K].
     for k in list(out):
         if k.endswith("_conv1d.weight"):
             w = out.pop(k)
@@ -113,14 +105,20 @@ def cpu_key_map():
 
 def map_backbone_key(k):
     """
-    Map checkpoint names into the CPU model's logical state-dict names.
+    Map checkpoint names into CPU model state-dict names.
 
-    This intentionally keeps LoRA suffixes such as .lora_A and .lora_B
-    unchanged because the CPU model must consume those tensors explicitly.
+    Important:
+      checkpoint: model.layers.N.attention.*
+      CPU model:  layers.N.attn.*
+
+    LoRA suffixes are preserved:
+      .lora_A -> .lora_A
+      .lora_B -> .lora_B
     """
 
-    if k in cpu_key_map():
-        return cpu_key_map()[k]
+    direct = cpu_key_map()
+    if k in direct:
+        return direct[k]
 
     if not k.startswith("model.layers."):
         return k
@@ -130,61 +128,53 @@ def map_backbone_key(k):
 
     prefix = f"layers.{li}."
 
-    aliases = {
-        "input_layernorm.": "input_layernorm.",
-        "post_attention_layernorm.": "post_attention_layernorm.",
+    # Layer norms.
+    if tail.startswith("input_layernorm."):
+        return prefix + tail
 
-        # KDA attention
-        "attention.q_proj.": "attention.q_proj.",
-        "attention.k_proj.": "attention.k_proj.",
-        "attention.v_proj.": "attention.v_proj.",
-        "attention.q_conv1d.": "attention.q_conv1d.",
-        "attention.k_conv1d.": "attention.k_conv1d.",
-        "attention.v_conv1d.": "attention.v_conv1d.",
-        "attention.f_proj.": "attention.f_proj.",
-        "attention.g_proj.": "attention.g_proj.",
-        "attention.b_proj.": "attention.b_proj.",
-        "attention.A_log": "attention.A_log",
-        "attention.dt_bias": "attention.dt_bias",
-        "attention.o_norm.": "attention.o_norm.",
-        "attention.o_proj.": "attention.o_proj.",
+    if tail.startswith("post_attention_layernorm."):
+        return prefix + tail
 
-        # MLA attention
-        "attention.q_a_proj.": "attention.q_a_proj.",
-        "attention.q_a_layernorm.": "attention.q_a_layernorm.",
-        "attention.q_b_proj.": "attention.q_b_proj.",
-        "attention.kv_a_proj_with_mqa.": "attention.kv_a_proj_with_mqa.",
-        "attention.kv_a_layernorm.": "attention.kv_a_layernorm.",
-        "attention.kv_b_proj.": "attention.kv_b_proj.",
-        "attention.dense.": "attention.dense.",
+    # ------------------------------------------------------------
+    # Attention
+    #
+    # Checkpoint namespace:
+    #   attention.q_proj.weight
+    #
+    # CPU model namespace:
+    #   attn.q_proj.weight
+    #
+    # The remainder is copied verbatim, including .lora_A/B.
+    # ------------------------------------------------------------
+    if tail.startswith("attention."):
+        return prefix + "attn." + tail[len("attention."):]
 
-        # MoE router
-        "mlp.gate.weight": "mlp.gate.weight",
-        "mlp.gate.expert_bias": "mlp.gate.expert_bias",
-
-        # Routed experts
-        "mlp.experts.gate_proj.": "mlp.experts.gate_proj.",
-        "mlp.experts.up_proj.": "mlp.experts.up_proj.",
-        "mlp.experts.down_proj.": "mlp.experts.down_proj.",
-
-        # Shared expert
-        "mlp.shared_experts.gate_proj.": "mlp.shared_experts.gate_proj.",
-        "mlp.shared_experts.up_proj.": "mlp.shared_experts.up_proj.",
-        "mlp.shared_experts.down_proj.": "mlp.shared_experts.down_proj.",
-
-        # Other MLP-related tensors
-        "mlp.shared_expert_gate.": "mlp.shared_expert_gate.",
-    }
-
-    for src, dst in aliases.items():
-        if tail.startswith(src):
-            return prefix + dst + tail[len(src):]
+    # ------------------------------------------------------------
+    # MoE / MLP
+    #
+    # The CPU model keeps the checkpoint's MLP substructure, so these
+    # can also be copied verbatim after the layer prefix.
+    # ------------------------------------------------------------
+    if tail.startswith("mlp."):
+        return prefix + tail
 
     return k
 
 
 def build_state_dict(weights):
-    return {
-        map_backbone_key(k): v
-        for k, v in weights.items()
-    }
+    state = {}
+
+    for k, v in weights.items():
+        mapped = map_backbone_key(k)
+
+        if mapped in state:
+            raise KeyError(
+                f"duplicate mapped checkpoint key:\n"
+                f"  {mapped}\n"
+                f"while processing original key:\n"
+                f"  {k}"
+            )
+
+        state[mapped] = v
+
+    return state
