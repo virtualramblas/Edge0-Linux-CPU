@@ -18,62 +18,85 @@ class RMSNorm(nn.Module):
         return y.to(x.dtype)*self.weight
 
 class DenseMLP(nn.Module):
+    """
+    Dense MLP used by the first (non-MoE) layer.
+
+    The module itself owns the three projections:
+        gate_proj: hidden -> intermediate
+        up_proj:   hidden -> intermediate
+        down_proj: intermediate -> hidden
+
+    There must NOT be another DenseMLP nested inside this module.
+    """
+
     def __init__(
         self,
         hidden_size,
         intermediate_size,
-        use_lora=False,
+        tensors=None,
         use_quantized=False,
+        use_lora=False,
+        lora_rank=16,
+        lora_alpha=32.0,
     ):
         super().__init__()
 
-        if use_quantized and use_lora:
-            Linear = QuantizedLoRALinear
-        elif use_quantized:
-            Linear = QuantizedLinear
-        elif use_lora:
-            Linear = LoRALinear
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+
+        # For model construction / wiring tests, tensors may be empty.
+        # The real checkpoint loader can replace these with the quantized
+        # projections once the model is fully constructed.
+        if use_quantized and tensors is not None:
+            self.gate_proj = QuantizedLoRALinear(
+                tensors=tensors,
+                name="mlp.gate_proj",
+                out_features=intermediate_size,
+                in_features=hidden_size,
+                rank=lora_rank if use_lora else 0,
+                alpha=lora_alpha,
+            )
+            self.up_proj = QuantizedLoRALinear(
+                tensors=tensors,
+                name="mlp.up_proj",
+                out_features=intermediate_size,
+                in_features=hidden_size,
+                rank=lora_rank if use_lora else 0,
+                alpha=lora_alpha,
+            )
+            self.down_proj = QuantizedLoRALinear(
+                tensors=tensors,
+                name="mlp.down_proj",
+                out_features=hidden_size,
+                in_features=intermediate_size,
+                rank=lora_rank if use_lora else 0,
+                alpha=lora_alpha,
+            )
         else:
-            Linear = nn.Linear
-
-        if use_lora and use_quantized:
-            kwargs = {
-                "rank": 16,
-                "alpha": 32,
-            }
-        else:
-            kwargs = {}
-
-        self.gate_proj = Linear(
-            hidden_size,
-            intermediate_size,
-            **kwargs,
-        )
-
-        self.up_proj = Linear(
-            hidden_size,
-            intermediate_size,
-            **kwargs,
-        )
-
-        self.down_proj = Linear(
-            intermediate_size,
-            hidden_size,
-            **kwargs,
-        )
-
-        self.mlp = DenseMLP(
-          hidden_size,
-          intermediate_size,
-          use_lora=True,
-          use_quantized=True,
-      )
+            self.gate_proj = nn.Linear(
+                hidden_size,
+                intermediate_size,
+                bias=False,
+            )
+            self.up_proj = nn.Linear(
+                hidden_size,
+                intermediate_size,
+                bias=False,
+            )
+            self.down_proj = nn.Linear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+            )
 
     def forward(self, x):
-        return self.down_proj(
-            F.silu(self.gate_proj(x))
-            * self.up_proj(x)
-        )
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+
+        # Edge0's dense MLP uses the gated SiLU form.
+        h = F.silu(gate) * up
+
+        return self.down_proj(h)
 
 class ExpertStore(nn.Module):
     def __init__(self,c,layer):
