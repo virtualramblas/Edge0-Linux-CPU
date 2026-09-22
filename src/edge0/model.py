@@ -144,21 +144,89 @@ class Layer(nn.Module):
         self.router=None if self.experts is None else Router(c)
         self.mlp=DenseMLP(c.hidden_size,c.intermediate_size) if self.experts is None else None
         self.shared=DenseMLP(c.hidden_size,c.moe_shared_expert_intermediate_size)
-    def forward(self,x,cache=None):
-        a,cs=self.attn(self.input_layernorm(x),cache); h=x+a; m=self.post_attention_layernorm(h)
-        y=self.mlp(m) if self.experts is None else self.experts(m,*self.router(m))+self.shared(m)
-        return h+y,cs
+
+    def forward(self, x, cache=None):
+        def check_finite(name, t):
+            if not torch.isfinite(t).all():
+                bad = (~torch.isfinite(t)).sum().item()
+                finite = torch.nan_to_num(
+                    t.detach().float(),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                raise RuntimeError(
+                    f"NaN/Inf in {name}: "
+                    f"shape={tuple(t.shape)}, "
+                    f"bad={bad}, "
+                    f"finite_abs_max={finite.abs().max().item()}"
+                )
+
+        check_finite("layer input", x)
+
+        # Attention path
+        attn_norm = self.input_layernorm(x)
+        check_finite("layer input_layernorm", attn_norm)
+
+        a, cs = self.attn(attn_norm, cache)
+        check_finite("layer attention output", a)
+
+        h = x + a
+        check_finite("layer post-attention residual", h)
+
+        # MLP path
+        m = self.post_attention_layernorm(h)
+        check_finite("layer post_attention_layernorm", m)
+
+        if self.experts is None:
+            y = self.mlp(m)
+        else:
+            y = self.experts(m, *self.router(m)) + self.shared(m)
+
+        check_finite("layer MLP output", y)
+
+        out = h + y
+        check_finite("layer output", out)
+
+        return out, cs
 
 class BailingCPUModel(nn.Module):
     def __init__(self,c,tensors):
         super().__init__(); self.c=c; self.word_embeddings=nn.Embedding(c.vocab_size,c.hidden_size)
         self.layers=nn.ModuleList([Layer(c,i,tensors) for i in range(c.num_hidden_layers)])
         self.norm=RMSNorm(c.hidden_size,c.rms_norm_eps); self.lm_head=nn.Linear(c.hidden_size,c.vocab_size,bias=False)
-    def forward(self,input_ids,past=None):
-        h=self.word_embeddings(input_ids); new=[]
-        for i,l in enumerate(self.layers):
-            h,cs=l(h,None if past is None else past[i]); new.append(cs)
-        return self.lm_head(self.norm(h)),new
+    
+    def forward(self, input_ids, past=None):
+        h = self.word_embeddings(input_ids)
+        new = []
+
+        if not torch.isfinite(h).all():
+            raise RuntimeError("NaN/Inf immediately after word_embeddings")
+
+        for i, l in enumerate(self.layers):
+            h, cs = l(h, None if past is None else past[i])
+            new.append(cs)
+
+            if not torch.isfinite(h).all():
+                bad = ~torch.isfinite(h)
+                raise RuntimeError(
+                    f"NaN/Inf after layer {i}: "
+                    f"shape={tuple(h.shape)}, "
+                    f"bad={bad.sum().item()}, "
+                    f"max_abs={torch.nan_to_num(h.abs(), nan=0.0, posinf=0.0, neginf=0.0).max().item()}"
+                )
+
+        h = self.norm(h)
+
+        if not torch.isfinite(h).all():
+            raise RuntimeError("NaN/Inf after final RMSNorm")
+
+        logits = self.lm_head(h)
+
+        if not torch.isfinite(logits).all():
+            raise RuntimeError("NaN/Inf after lm_head")
+
+        return logits, new
 
 def load_ram_model(model_dir):
     root = Path(model_dir)
@@ -179,37 +247,57 @@ def load_ram_model(model_dir):
     model = BailingCPUModel(cfg, tensors)
 
     state = build_state_dict(tensors)
-    own = dict(model.named_parameters())
+
+    # IMPORTANT:
+    # named_parameters() does not include register_buffer() tensors.
+    # We need both parameters and buffers because INT4 weights,
+    # scales, and biases are registered as buffers.
+    own = {}
+
+    for k, v in model.named_parameters():
+        own[k] = v
+
+    for k, v in model.named_buffers():
+        own[k] = v
 
     loaded = []
     skipped = []
 
-    for k, v in state.items():
-        if k in own:
-            if own[k].shape == v.shape:
-                loaded.append((k, tuple(v.shape)))
-            else:
+    with torch.no_grad():
+        for k, v in state.items():
+            if k not in own:
+                skipped.append(
+                    (
+                        k,
+                        tuple(v.shape),
+                        "missing model parameter/buffer",
+                        None,
+                    )
+                )
+                continue
+
+            dst = own[k]
+
+            if dst.shape != v.shape:
                 skipped.append(
                     (
                         k,
                         tuple(v.shape),
                         "shape mismatch",
-                        tuple(own[k].shape),
+                        tuple(dst.shape),
                     )
                 )
-        else:
-            skipped.append(
-                (
-                    k,
-                    tuple(v.shape),
-                    "missing model parameter",
-                    None,
-                )
-            )
+                continue
+
+            # Actually copy the checkpoint tensor into the model.
+            dst.copy_(v.to(device=dst.device, dtype=dst.dtype))
+            loaded.append((k, tuple(v.shape)))
 
     print("\n=== LOAD DIAGNOSTIC ===")
     print("checkpoint entries:", len(state))
-    print("model parameters:", len(own))
+    print("model parameters:", len(dict(model.named_parameters())))
+    print("model buffers:", len(dict(model.named_buffers())))
+    print("model loadable tensors:", len(own))
     print("shape/name matches:", len(loaded))
     print("skipped:", len(skipped))
 
@@ -219,11 +307,9 @@ def load_ram_model(model_dir):
         parts = key.split(".")
 
         if parts[0] == "layers":
-            # layers.0.attn.q_proj.lora_A -> attn.q_proj.lora_A
             return ".".join(parts[2:])
 
         return key
-
 
     print("\n=== SKIPPED COMPONENTS ===")
 
@@ -232,20 +318,13 @@ def load_ram_model(model_dir):
     for k, n in counts.most_common():
         print(f"{n:4d}  {k}")
 
-
     print("\n=== FIRST 150 SKIPPED ===")
 
     for x in skipped[:150]:
         print(x)
 
-
-
     print("\n=== MATCHES ===")
     for item in loaded:
-        print(item)
-
-    print("\n=== FIRST 100 SKIPPED ===")
-    for item in skipped[:100]:
         print(item)
 
     return model, cfg, loaded, skipped

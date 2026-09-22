@@ -654,6 +654,22 @@ class KDAAttention(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         state: Optional[dict] = None,
     ):
+        def check_finite(name, t):
+            if not torch.isfinite(t).all():
+                bad = (~torch.isfinite(t)).sum().item()
+                finite = torch.nan_to_num(
+                    t.detach().float(),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                raise RuntimeError(
+                    f"NaN/Inf in KDA {name}: "
+                    f"shape={tuple(t.shape)}, "
+                    f"bad={bad}, "
+                    f"finite_abs_max={finite.abs().max().item()}"
+                )
+
         if x.ndim != 3:
             raise ValueError(
                 "KDAAttention expects [B,T,C], got "
@@ -661,18 +677,27 @@ class KDAAttention(nn.Module):
             )
 
         bsz, seq_len, _ = x.shape
+        check_finite("input", x)
 
-        q = self._reshape_heads(
-            self.q_proj(x)
-        )
+        # ------------------------------------------------------------
+        # Q / K / V projections
+        # ------------------------------------------------------------
+        q_raw = self.q_proj(x)
+        check_finite("q_proj", q_raw)
 
-        k = self._reshape_heads(
-            self.k_proj(x)
-        )
+        k_raw = self.k_proj(x)
+        check_finite("k_proj", k_raw)
 
-        v = self._reshape_heads(
-            self.v_proj(x)
-        )
+        v_raw = self.v_proj(x)
+        check_finite("v_proj", v_raw)
+
+        q = self._reshape_heads(q_raw)
+        k = self._reshape_heads(k_raw)
+        v = self._reshape_heads(v_raw)
+
+        check_finite("q reshape", q)
+        check_finite("k reshape", k)
+        check_finite("v reshape", v)
 
         q_flat = q.reshape(
             bsz,
@@ -692,37 +717,41 @@ class KDAAttention(nn.Module):
             self.inner_size,
         )
 
+        # ------------------------------------------------------------
+        # Short convolution
+        # ------------------------------------------------------------
         q_flat, q_state = self.q_conv(
             q_flat,
             None if state is None
             else state.get("q_conv"),
         )
+        check_finite("q_conv", q_flat)
 
         k_flat, k_state = self.k_conv(
             k_flat,
             None if state is None
             else state.get("k_conv"),
         )
+        check_finite("k_conv", k_flat)
 
         v_flat, v_state = self.v_conv(
             v_flat,
             None if state is None
             else state.get("v_conv"),
         )
+        check_finite("v_conv", v_flat)
 
-        q = self._reshape_heads(
-            q_flat
-        )
+        q = self._reshape_heads(q_flat)
+        k = self._reshape_heads(k_flat)
+        v = self._reshape_heads(v_flat)
 
-        k = self._reshape_heads(
-            k_flat
-        )
+        check_finite("q after conv", q)
+        check_finite("k after conv", k)
+        check_finite("v after conv", v)
 
-        v = self._reshape_heads(
-            v_flat
-        )
-
-        # Per-head q/k normalization.
+        # ------------------------------------------------------------
+        # Per-head q/k normalization
+        # ------------------------------------------------------------
         q = F.normalize(
             q.float(),
             dim=-1,
@@ -733,6 +762,12 @@ class KDAAttention(nn.Module):
             dim=-1,
         ).to(k.dtype)
 
+        check_finite("q normalization", q)
+        check_finite("k normalization", k)
+
+        # ------------------------------------------------------------
+        # RoPE
+        # ------------------------------------------------------------
         if position_ids is not None:
             q_rope = q.permute(
                 0, 2, 1, 3
@@ -754,6 +789,9 @@ class KDAAttention(nn.Module):
                 self.rope_theta,
             )
 
+            check_finite("q RoPE", q_rope)
+            check_finite("k RoPE", k_rope)
+
             q = q_rope.permute(
                 0, 2, 1, 3
             )
@@ -762,18 +800,28 @@ class KDAAttention(nn.Module):
                 0, 2, 1, 3
             )
 
-        f = self._reshape_heads(
-            self.f_proj(x)
-        )
+        # ------------------------------------------------------------
+        # KDA gate projection
+        # ------------------------------------------------------------
+        f_raw = self.f_proj(x)
+        check_finite("f_proj", f_raw)
 
+        f = self._reshape_heads(f_raw)
+        check_finite("f reshape", f)
+
+        # ------------------------------------------------------------
+        # Decay parameters / gate
+        # ------------------------------------------------------------
         A = -torch.exp(
             self.A_log.float()
         )
+        check_finite("A", A)
 
         dt_bias = self.dt_bias.reshape(
             self.num_heads,
             self.head_dim,
         )
+        check_finite("dt_bias", dt_bias)
 
         g = kda_gate(
             f,
@@ -782,11 +830,20 @@ class KDAAttention(nn.Module):
             lower_bound=self.safe_gate_lower,
             safe_gate=self.safe_gate,
         )
+        check_finite("kda gate", g)
 
-        beta = torch.sigmoid(
-            self.b_proj(x)
-        )
+        # ------------------------------------------------------------
+        # Beta
+        # ------------------------------------------------------------
+        beta_raw = self.b_proj(x)
+        check_finite("b_proj", beta_raw)
 
+        beta = torch.sigmoid(beta_raw)
+        check_finite("beta", beta)
+
+        # ------------------------------------------------------------
+        # Recurrence
+        # ------------------------------------------------------------
         previous_state = (
             None
             if state is None
@@ -801,24 +858,40 @@ class KDAAttention(nn.Module):
             beta,
             previous_state,
         )
+        check_finite("recurrence", y)
 
+        # ------------------------------------------------------------
+        # Output normalization
+        # ------------------------------------------------------------
         y = self.o_norm(y)
+        check_finite("o_norm", y)
+
+        # ------------------------------------------------------------
+        # Output gate
+        # ------------------------------------------------------------
+        g_raw = self.g_proj(x)
+        check_finite("g_proj", g_raw)
 
         gate = torch.sigmoid(
-            self._reshape_heads(
-                self.g_proj(x)
-            )
+            self._reshape_heads(g_raw)
         )
+        check_finite("output gate", gate)
 
         y = y * gate
+        check_finite("gated output", y)
 
+        # ------------------------------------------------------------
+        # Output projection
+        # ------------------------------------------------------------
         y = y.reshape(
             bsz,
             seq_len,
             self.inner_size,
         )
+        check_finite("flattened output", y)
 
         y = self.o_proj(y)
+        check_finite("o_proj", y)
 
         new_state = {
             "q_conv": q_state,

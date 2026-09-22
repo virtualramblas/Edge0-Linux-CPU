@@ -365,6 +365,47 @@ class QuantizedLoRALinear(nn.Module):
         )
 
     def forward(self, x):
+        def check_finite(name, t):
+            if not torch.isfinite(t).all():
+                bad = (~torch.isfinite(t)).sum().item()
+                finite = torch.nan_to_num(
+                    t.detach().float(),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                raise RuntimeError(
+                    f"NaN/Inf in QuantizedLoRALinear {name}: "
+                    f"shape={tuple(t.shape)}, "
+                    f"bad={bad}, "
+                    f"finite_abs_max={finite.abs().max().item()}"
+                )
+
+        check_finite("input", x)
+
+        # Inspect the actual buffers attached to this module.
+        print(
+            "[QuantizedLoRALinear] "
+            f"in={self.in_features} "
+            f"out={self.out_features} "
+            f"weight_shape={tuple(self.weight.shape)} "
+            f"weight_dtype={self.weight.dtype} "
+            f"scales_shape={tuple(self.scales.shape)} "
+            f"scales_dtype={self.scales.dtype} "
+            f"biases_shape={tuple(self.biases.shape)} "
+            f"biases_dtype={self.biases.dtype}"
+        )
+
+        print(
+            "[QuantizedLoRALinear] "
+            f"weight min/max unavailable for uint32; "
+            f"scales finite={torch.isfinite(self.scales.float()).all().item()} "
+            f"biases finite={torch.isfinite(self.biases.float()).all().item()} "
+            f"lora_A_absmax={self.lora_A.detach().abs().max().item()} "
+            f"lora_B_absmax={self.lora_B.detach().abs().max().item()}"
+        )
+
+        # INT4 base path.
         base = expert_linear(
             x,
             self.weight,
@@ -372,10 +413,25 @@ class QuantizedLoRALinear(nn.Module):
             self.biases,
             group_size=self.group_size,
         )
+        check_finite("base", base)
+
+        # LoRA path.
+        lora_a = F.linear(
+            x,
+            self.lora_A,
+        )
+        check_finite("lora_A output", lora_a)
 
         delta = F.linear(
-            F.linear(x, self.lora_A),
+            lora_a,
             self.lora_B,
         )
+        check_finite("lora_B output", delta)
 
-        return base + self.scaling * delta
+        scaled_delta = self.scaling * delta
+        check_finite("scaled LoRA", scaled_delta)
+
+        output = base + scaled_delta
+        check_finite("output", output)
+
+        return output
